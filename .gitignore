@@ -1,1 +1,1 @@
-Nothing should be ignored since only a shell script file was added and no build artifacts, dependencies, or temporary files were detected in the changes.
+Nothing should be ignored based on the provided file changes. The only added file is a shell script (`deep_system_scan_v5.1.sh`) which appears to be source code and should not be ignored.
