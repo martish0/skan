@@ -1,1 +1,1 @@
-Nothing should be ignored based on the provided file changes. The only added file is a shell script (`deep_system_scan_v5.1.sh`) which appears to be source code and should not be ignored.
+Nothing needs to be added to .gitignore since only a shell script file was added, which doesn't fall under any of the categories that should be ignored (no build artifacts, dependencies, temporary files, or sensitive data).
