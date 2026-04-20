@@ -1,1 +1,1 @@
-Nothing needs to be added to .gitignore since only a shell script file was added, which doesn't fall under any of the categories that should be ignored (no build artifacts, dependencies, temporary files, or sensitive data).
+Nothing needs to be added to .gitignore since the only change is adding a shell script file (`deep_system_scan_v6.sh`) which is a source code file and should not be ignored.
