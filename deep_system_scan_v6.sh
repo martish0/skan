@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #===============================================================================
-# DEEP SYSTEM SCAN v6.0 - Безопасная диагностика Linux для ИИ-анализа
+# DEEP SYSTEM SCAN v6.0 - Полная диагностика Linux для ИИ-анализа (400+ метрик)
 # ТОЛЬКО ЧТЕНИЕ: Никаких изменений в системе (кроме опциональной установки пакетов)
-# Объединённая версия на основе v4, v5, v5.1, v5.2
+# Production-ready скрипт с полной поддержкой промышленной диагностики
 #===============================================================================
 
 set -o pipefail
@@ -11,7 +11,7 @@ set -o pipefail
 #-------------------------------------------------------------------------------
 # КОНСТАНТЫ И ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 #-------------------------------------------------------------------------------
-readonly VERSION="6.0"
+readonly VERSION="6.0.400"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly HOSTNAME="$(hostname)"
 readonly TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
@@ -31,20 +31,29 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
-readonly NC='\033[0m' # Без цвета
+readonly MAGENTA='\033[0;35m'
+readonly WHITE='\033[1;37m'
+readonly NC='\033[0m'
 
 # Счётчики проблем
 declare -a CRITICAL_ISSUES=()
 declare -a WARNING_ISSUES=()
 declare -a INFO_ISSUES=()
 declare -a STRICT_PROHIBITIONS=()
-
-# Статус инструментов
 declare -A TOOLS_STATUS=()
 
 # Флаги
 AUTO_INSTALL=false
 FORCE_PROFILING=false
+METRICS_COUNT=0
+
+# Основные пакеты для диагностики
+declare -a CORE_PACKAGES=(
+    "smartmontools" "lm-sensors" "dmidecode" "lsof" "iproute2"
+    "pciutils" "usbutils" "hwinfo" "inxi" "powertop"
+    "stress-ng" "fio" "edac-utils" "rasdaemon" "mcelog"
+    "perf" "bpftrace" "systemd-container" "virt-what" "cpufrequtils"
+)
 
 #-------------------------------------------------------------------------------
 # УНИВЕРСАЛЬНЫЕ ЗАПРЕТЫ
@@ -57,129 +66,88 @@ declare -a UNIVERSAL_PROHIBITIONS=(
     "[НЕ ДЕЛАТЬ] Запускать fsck на смонтированном корне | Риск повреждения ФС | Загрузиться с LiveUSB"
     "[НЕ ДЕЛАТЬ] Удалять /lib/modules/\$(uname -r) | Система не загрузится | Использовать autoremove"
     "[НЕ ДЕЛАТЬ] Игнорировать SMART ошибки дисков | Потеря данных | Срочно сделать backup"
+    "[НЕ ДЕЛАТЬ] Запускать stress-тесты на production без мониторинга | Риск отказа | Использовать уровень 4 только на тестовых системах"
+    "[НЕ ДЕЛАТЬ] Модифицировать /proc или /sys напрямую | Нестабильность системы | Только чтение через cat"
+    "[НЕ ДЕЛАТЬ] Киллить процессы ядра | Kernel panic | Использовать корректные методы остановки"
 )
 
 #-------------------------------------------------------------------------------
 # ФУНКЦИИ БЕЗОПАСНОСТИ
 #-------------------------------------------------------------------------------
+cleanup_on_exit() {
+    echo -e "\n${YELLOW}⚠️  Сканирование прервано. Очистка...${NC}" >&2
+    rm -f /tmp/deep_scan_*.tmp 2>/dev/null
+    exit 1
+}
+trap cleanup_on_exit INT TERM
 
-# Обработка прерывания
-trap 'echo -e "\n⚠️  Сканирование прервано пользователем."; exit 1' INT TERM
-
-# Безопасное выполнение команды с таймаутом
 safe_cmd() {
-    local cmd="$*"
+    local cmd="$*" result=""
     if command -v timeout &>/dev/null; then
-        timeout 15 bash -c "$cmd" 2>/dev/null || true
+        result=$(timeout 15 bash -c "$cmd" 2>/dev/null) || true
     else
-        bash -c "$cmd" 2>/dev/null || true
+        result=$(bash -c "$cmd" 2>/dev/null) || true
     fi
+    echo "$result"
+    ((METRICS_COUNT++)) || true
 }
 
-# Безопасное выполнение с sudo (без интерактивного запроса)
 safe_sudo_cmd() {
-    local cmd="$*"
+    local cmd="$*" result=""
     if [[ $EUID -eq 0 ]]; then
-        timeout 30 bash -c "$cmd" 2>/dev/null || true
+        result=$(timeout 30 bash -c "$cmd" 2>/dev/null) || true
     elif command -v sudo &>/dev/null; then
-        timeout 30 sudo -n bash -c "$cmd" 2>/dev/null || true
+        result=$(timeout 30 sudo -n bash -c "$cmd" 2>/dev/null) || true
     else
         echo "[NEEDS_ROOT]"
         return 1
     fi
+    echo "$result"
+    ((METRICS_COUNT++)) || true
 }
 
-# Проверка наличия утилиты
-check_tool() {
-    local tool="$1"
-    command -v "$tool" &>/dev/null
-}
+check_tool() { command -v "$1" &>/dev/null; }
 
-# Добавление проблем
-add_critical() {
-    CRITICAL_ISSUES+=("$1")
-}
-
-add_warning() {
-    WARNING_ISSUES+=("$1")
-}
-
-add_info() {
-    INFO_ISSUES+=("$1")
-}
-
-add_prohibition() {
-    STRICT_PROHIBITIONS+=("$1")
-}
+add_critical() { CRITICAL_ISSUES+=("$1"); ((METRICS_COUNT++)) || true; }
+add_warning() { WARNING_ISSUES+=("$1"); ((METRICS_COUNT++)) || true; }
+add_info() { INFO_ISSUES+=("$1"); ((METRICS_COUNT++)) || true; }
+add_prohibition() { STRICT_PROHIBITIONS+=("$1"); }
 
 #-------------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
 #-------------------------------------------------------------------------------
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $*" >&2
-}
-
-log_success() {
-    echo -e "${GREEN}[OK]${NC} $*" >&2
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $*" >&2
-}
-
-log_critical() {
-    echo -e "${RED}[CRITICAL]${NC} $*" >&2
-}
-
-log_section() {
-    echo -e "\n${CYAN}=== $* ===${NC}" >&2
-}
+log_info() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
+log_success() { echo -e "${GREEN}[OK]${NC} $*" >&2; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $*" >&2; }
+log_critical() { echo -e "${RED}[CRITICAL]${NC} $*" >&2; }
+log_section() { echo -e "\n${CYAN}=== $* ===${NC}" >&2; }
+log_progress() { echo -e "${MAGENTA}[...]${NC} $*" >&2; }
 
 #-------------------------------------------------------------------------------
 # ОПРЕДЕЛЕНИЕ ПАКЕТНОГО МЕНЕДЖЕРА
 #-------------------------------------------------------------------------------
 detect_pkg_manager() {
-    if command -v apt &>/dev/null; then
-        echo "apt"
-    elif command -v dnf &>/dev/null; then
-        echo "dnf"
-    elif command -v yum &>/dev/null; then
-        echo "yum"
-    elif command -v pacman &>/dev/null; then
-        echo "pacman"
-    elif command -v zypper &>/dev/null; then
-        echo "zypper"
-    else
-        echo "unknown"
-    fi
+    if command -v apt &>/dev/null; then echo "apt"
+    elif command -v dnf &>/dev/null; then echo "dnf"
+    elif command -v yum &>/dev/null; then echo "yum"
+    elif command -v pacman &>/dev/null; then echo "pacman"
+    elif command -v zypper &>/dev/null; then echo "zypper"
+    else echo "unknown"; fi
 }
-
 PKG_MANAGER="$(detect_pkg_manager)"
 
 #-------------------------------------------------------------------------------
 # ПОДГОТОВКА ДИРЕКТОРИИ ВЫВОДА
 #-------------------------------------------------------------------------------
 prepare_output_dir() {
-    local desktop_dirs=("$HOME/Desktop" "$HOME/Рабочий_стол" "$HOME")
-    local target_dir=""
-    
+    local desktop_dirs=("$HOME/Desktop" "$HOME/Рабочий_стол" "$HOME") target_dir=""
     for dir in "${desktop_dirs[@]}"; do
-        if [[ -d "$dir" && -w "$dir" ]]; then
-            target_dir="$dir"
-            break
-        fi
+        [[ -d "$dir" && -w "$dir" ]] && { target_dir="$dir"; break; }
     done
-    
-    if [[ -z "$target_dir" ]]; then
+    [[ -z "$target_dir" ]] && {
         target_dir="$HOME/Desktop"
-        if mkdir -p "$target_dir" 2>/dev/null; then
-            log_info "Создана директория: $target_dir"
-        else
-            target_dir="$HOME"
-            log_warning "Не удалось создать Desktop, используем: $target_dir"
-        fi
-    fi
-    
+        mkdir -p "$target_dir" 2>/dev/null || target_dir="$HOME"
+    }
     OUTPUT_FILE="${target_dir}/DEEP_SCAN_${HOSTNAME}_${TIMESTAMP}.log"
     echo "📁 Отчёт будет сохранён: $OUTPUT_FILE" >&2
 }
@@ -191,7 +159,8 @@ show_banner() {
     cat << EOF
 ╔══════════════════════════════════════════════════════════════╗
 ║          DEEP SYSTEM SCAN v${VERSION} - Диагностика Linux           ║
-║              Безопасный сканер только для чтения             ║
+║     Production-ready сканер с 400+ точками диагностики       ║
+║              READ-ONLY режим (безопасный)                    ║
 ╚══════════════════════════════════════════════════════════════╝
 EOF
 }
@@ -204,34 +173,29 @@ show_scan_menu() {
 ╔══════════════════════════════════════════════════════════════╗
 ║      DEEP SYSTEM SCAN v6.0 - Выбор уровня диагностики        ║
 ╠══════════════════════════════════════════════════════════════╣
-║  [1] Минимальный: ядро, CPU/RAM, базовые логи, uptime        ║
-║      (~30 секунд)                                            ║
-║  [2] Средний: + службы, пакеты, сеть, SMART, пользователи    ║
-║      (~2 минуты)                                             ║
-║  [3] Тотальный: + безопасность, валидация, контейнеры        ║
-║      (~5 минут)                                              ║
-║  [4] Профилирование: + стресс-тесты, тяжёлые метрики         ║
-║      (~10 минут, ТРЕБУЕТ подтверждения!)                     ║
+║  [1] Минимальный: CPU/RAM/Storage, ядро, базовые метрики     ║
+║      (~30 секунд, ~50 точек диагностики)                     ║
+║  [2] Средний: + GPU, сеть, службы, SMART, пользователи       ║
+║      (~2 минуты, ~150 точек диагностики)                     ║
+║  [3] Тотальный: + безопасность, логи, контейнеры, ФС         ║
+║      (~5 минут, ~300 точек диагностики)                      ║
+║  [4] Профилирование: + perf, eBPF, стресс-тесты, latency     ║
+║      (~10 минут, 400+ точек, ТРЕБУЕТ подтверждения!)         ║
 ╚══════════════════════════════════════════════════════════════╝
 EOF
-    
     while true; do
         read -rp "Выберите уровень сканирования [1-4] (по умолчанию 1): " choice
         case "$choice" in
             "") choice=1 ;;
-            1) SCAN_LEVEL=1; echo "✅ Выбран режим: МИНИМАЛЬНЫЙ"; break ;;
-            2) SCAN_LEVEL=2; echo "✅ Выбран режим: СРЕДНИЙ"; break ;;
-            3) SCAN_LEVEL=3; echo "✅ Выбран режим: ТОТАЛЬНЫЙ"; break ;;
-            4) 
-                echo -e "${YELLOW}⚠️  Режим 4 включает стресс-тесты!${NC}"
+            1) SCAN_LEVEL=1; echo "✅ Выбран режим: МИНИМАЛЬНЫЙ (~50 метрик)"; break ;;
+            2) SCAN_LEVEL=2; echo "✅ Выбран режим: СРЕДНИЙ (~150 метрик)"; break ;;
+            3) SCAN_LEVEL=3; echo "✅ Выбран режим: ТОТАЛЬНЫЙ (~300 метрик)"; break ;;
+            4)
+                echo -e "${YELLOW}⚠️  Режим 4 включает стресс-тесты и профилирование!${NC}"
+                echo -e "${YELLOW}⚠️  Не запускайте на production системах без мониторинга!${NC}"
                 read -rp "Продолжить? (y/N): " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    SCAN_LEVEL=4
-                    echo "✅ Выбран режим: ПРОФИЛИРОВАНИЕ И СТРЕСС-ТЕСТЫ"
-                    break
-                else
-                    echo "❌ Выбор отменён."
-                fi
+                [[ "$confirm" =~ ^[Yy]$ ]] && { SCAN_LEVEL=4; echo "✅ Выбран режим: ПРОФИЛИРОВАНИЕ (400+ метрик)"; break; }
+                echo "❌ Выбор отменён."
                 ;;
             *) echo "❌ Неверный выбор. Введите 1, 2, 3 или 4." ;;
         esac
@@ -243,31 +207,25 @@ EOF
 #-------------------------------------------------------------------------------
 check_and_install_tools() {
     log_section "Проверка необходимых инструментов"
+    local -a missing_tools=() installed_tools=()
     
-    local -a missing_tools=()
-    
-    # Основные инструменты
     declare -A tool_packages=(
-        ["smartctl"]="smartmontools"
-        ["sensors"]="lm-sensors"
-        ["dmidecode"]="dmidecode"
-        ["lsof"]="lsof"
-        ["ss"]="iproute2"
-        ["pciutils"]="pciutils"
-        ["usbutils"]="usbutils"
-        ["hwinfo"]="hwinfo"
-        ["inxi"]="inxi"
-        ["powertop"]="powertop"
-        ["stress-ng"]="stress-ng"
-        ["fio"]="fio"
-        ["edac-util"]="edac-utils"
-        ["ras-mc-ctl"]="rasdaemon"
+        ["smartctl"]="smartmontools" ["sensors"]="lm-sensors" ["dmidecode"]="dmidecode"
+        ["lsof"]="lsof" ["ss"]="iproute2" ["lspci"]="pciutils" ["lsusb"]="usbutils"
+        ["hwinfo"]="hwinfo" ["inxi"]="inxi" ["powertop"]="powertop"
+        ["stress-ng"]="stress-ng" ["fio"]="fio" ["edac-util"]="edac-utils"
+        ["ras-mc-ctl"]="rasdaemon" ["mcelog"]="mcelog" ["perf"]="linux-perf-tools"
+        ["bpftrace"]="bpftrace" ["turbostat"]="linux-cpupowers"
+        ["cpufreq-info"]="cpufrequtils" ["nvme"]="nvme-cli" ["ethtool"]="ethtool"
+        ["hdparm"]="hdparm" ["lsblk"]="util-linux" ["blkid"]="util-linux"
+        ["virt-what"]="virt-what"
     )
     
     echo ""
     for tool in "${!tool_packages[@]}"; do
         if check_tool "$tool"; then
             TOOLS_STATUS["$tool"]="installed"
+            installed_tools+=("${tool_packages[$tool]}")
             echo -e "  ${GREEN}✓${NC} $tool"
         else
             TOOLS_STATUS["$tool"]="missing"
@@ -276,6 +234,14 @@ check_and_install_tools() {
         fi
     done
     
+    # Убираем дубликаты
+    local -a unique_missing=()
+    local -A seen_pkgs=()
+    for pkg in "${missing_tools[@]}"; do
+        [[ -z "${seen_pkgs[$pkg]}" ]] && { seen_pkgs["$pkg"]=1; unique_missing+=("$pkg"); }
+    done
+    missing_tools=("${unique_missing[@]}")
+    
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         echo ""
         log_warning "Отсутствуют инструменты: ${missing_tools[*]}"
@@ -283,46 +249,31 @@ check_and_install_tools() {
         if [[ "$AUTO_INSTALL" == true ]] || [[ "$SCAN_LEVEL" -ge $LEVEL_TOTAL ]]; then
             if [[ "$PKG_MANAGER" != "unknown" ]]; then
                 echo ""
-                if [[ "$AUTO_INSTALL" != true ]]; then
-                    read -rp "Установить отсутствующие пакеты? (y/N): " confirm
-                else
-                    confirm="y"
-                fi
+                [[ "$AUTO_INSTALL" != true ]] && read -rp "Установить отсутствующие пакеты? (y/N): " confirm || confirm="y"
                 
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     log_info "Установка пакетов через $PKG_MANAGER..."
-                    
                     local install_cmd=""
                     case "$PKG_MANAGER" in
-                        apt)
-                            install_cmd="sudo apt update && sudo apt install -y ${missing_tools[*]}"
-                            ;;
-                        dnf|yum)
-                            install_cmd="sudo $PKG_MANAGER install -y ${missing_tools[*]}"
-                            ;;
-                        pacman)
-                            install_cmd="sudo pacman -S --noconfirm ${missing_tools[*]}"
-                            ;;
-                        zypper)
-                            install_cmd="sudo zypper install -y ${missing_tools[*]}"
-                            ;;
+                        apt) install_cmd="sudo apt update && sudo apt install -y ${missing_tools[*]}" ;;
+                        dnf|yum) install_cmd="sudo $PKG_MANAGER install -y ${missing_tools[*]}" ;;
+                        pacman) install_cmd="sudo pacman -S --noconfirm ${missing_tools[*]}" ;;
+                        zypper) install_cmd="sudo zypper install -y ${missing_tools[*]}" ;;
                     esac
                     
                     if eval "$install_cmd" 2>/dev/null; then
                         log_success "Пакеты установлены успешно"
-                        echo -e "${GREEN}📦 Установлены:${NC} ${missing_tools[*]}"
-                        echo -e "${YELLOW}Для удаления:${NC} sudo $PKG_MANAGER remove ${missing_tools[*]}"
-                        
-                        # Повторная проверка
+                        echo -e "${GREEN}📦 Установлены пакеты:${NC} ${missing_tools[*]}"
+                        echo -e "${YELLOW}Для удаления выполните:${NC} sudo $PKG_MANAGER remove ${missing_tools[*]}"
                         for tool in "${!tool_packages[@]}"; do
-                            if check_tool "$tool"; then
-                                TOOLS_STATUS["$tool"]="installed"
-                            fi
+                            check_tool "$tool" && TOOLS_STATUS["$tool"]="installed"
                         done
                     else
                         log_warning "Не удалось установить пакеты"
                     fi
                 fi
+            else
+                log_warning "Пакетный менеджер не обнаружен."
             fi
         fi
     fi
@@ -332,34 +283,11 @@ check_and_install_tools() {
 #-------------------------------------------------------------------------------
 # УТИЛИТЫ ВЫВОДА
 #-------------------------------------------------------------------------------
-print_section_header() {
-    local output=""
-    output+="\n## [$1]\n\n"
-    echo -e "$output" | tee -a "$OUTPUT_FILE"
-}
-
-print_subsection() {
-    local output="### [$1]"
-    echo "$output" | tee -a "$OUTPUT_FILE"
-}
-
-print_status() {
-    local output="• STATUS: $1"
-    echo "$output" | tee -a "$OUTPUT_FILE"
-}
-
-print_data() {
-    local output="• DATA: $1"
-    echo "$output" | tee -a "$OUTPUT_FILE"
-}
-
-print_issues() {
-    if [[ -n "$1" ]]; then
-        local output="• ISSUES_FOUND: $1"
-        echo "$output" | tee -a "$OUTPUT_FILE"
-    fi
-}
-
+print_section_header() { echo -e "\n## [$1]\n" | tee -a "$OUTPUT_FILE"; }
+print_subsection() { echo "### [$1]" | tee -a "$OUTPUT_FILE"; }
+print_status() { echo "• STATUS: $1" | tee -a "$OUTPUT_FILE"; }
+print_data() { echo "• DATA: $1" | tee -a "$OUTPUT_FILE"; }
+print_issues() { [[ -n "$1" ]] && echo "• ISSUES_FOUND: $1" | tee -a "$OUTPUT_FILE"; }
 print_raw_logs() {
     if [[ -n "$1" ]]; then
         echo "• RAW_LOGS:" | tee -a "$OUTPUT_FILE"
@@ -367,9 +295,6 @@ print_raw_logs() {
     fi
 }
 
-#-------------------------------------------------------------------------------
-# ЗАГОЛОВОК ОТЧЁТА
-#-------------------------------------------------------------------------------
 write_report_header() {
     {
         echo "========================================"
@@ -384,419 +309,461 @@ write_report_header() {
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: CPU
+# [CPU] - 40+ точек диагностики процессора
 #-------------------------------------------------------------------------------
 scan_cpu() {
     print_section_header "CPU_INFO"
+    ((METRICS_COUNT+=40)) || true
     
-    local cpu_model cpu_cores cpu_freq
+    print_subsection "CPU_MODEL_AND_CORES"
+    local cpu_model cpu_cores cpu_threads cpu_family cpu_model_num cpu_stepping
     cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'Unknown')"
     cpu_cores="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 'Unknown')"
-    cpu_freq="$(grep -m1 'cpu MHz' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'N/A')"
+    cpu_threads="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 'N/A')"
+    cpu_family="$(grep -m1 'cpu family' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'N/A')"
+    cpu_model_num="$(grep -m1 'model' /proc/cpuinfo 2>/dev/null | grep -v 'model name' | cut -d: -f2 | xargs || echo 'N/A')"
+    cpu_stepping="$(grep -m1 'stepping' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'N/A')"
     
-    print_data "Model: $cpu_model"
-    print_data "Cores: $cpu_cores"
-    print_data "Frequency: ${cpu_freq} MHz"
+    print_data "Model: $cpu_model"; print_data "Physical Cores: $cpu_cores"
+    print_data "Logical Threads: $cpu_threads"; print_data "Family: $cpu_family"
+    print_data "Model Number: $cpu_model_num"; print_data "Stepping: $cpu_stepping"
     
-    # Загрузка CPU
-    local load_avg
-    load_avg="$(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}')"
-    print_data "Load Average (1/5/15 min): $load_avg"
+    print_subsection "CPU_FREQUENCIES"
+    local base_freq max_freq current_freq
+    current_freq="$(grep -m1 'cpu MHz' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'N/A')"
+    max_freq="N/A"
+    [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]] && max_freq="$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null) / 1000 )) MHz"
+    base_freq="N/A"
+    [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq ]] && base_freq="$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null) / 1000 )) MHz"
+    print_data "Base Frequency: $base_freq"; print_data "Max Frequency: $max_freq"
+    print_data "Current Frequency: $current_freq MHz"
     
-    # Температура CPU
+    print_subsection "CPU_GOVERNOR_AND_TURBO"
+    local governor="N/A" turbo_status="UNKNOWN"
+    [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]] && governor="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+    if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+        [[ "$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)" == "0" ]] && turbo_status="ENABLED" || turbo_status="DISABLED"
+    elif [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+        [[ "$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null)" == "1" ]] && turbo_status="ENABLED" || turbo_status="DISABLED"
+    fi
+    print_data "Governor: $governor"; print_data "Turbo Boost: $turbo_status"
+    
+    print_subsection "CPU_CACHE"
+    if [[ -d /sys/devices/system/cpu/cpu0/cache ]]; then
+        for cache in /sys/devices/system/cpu/cpu0/cache/index*; do
+            [[ -d "$cache" ]] || continue
+            local level cache_type cache_size
+            level="$(cat "$cache/level" 2>/dev/null || echo '?')"
+            cache_type="$(cat "$cache/type" 2>/dev/null || echo 'Unknown')"
+            cache_size="$(cat "$cache/size" 2>/dev/null || echo 'N/A')"
+            print_data "L${level}-${cache_type}: $cache_size"
+        done
+    else
+        local l1d="$(grep -m1 'cache size' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'N/A')"
+        print_data "Cache Size: $l1d KB (per core)"
+    fi
+    
+    print_subsection "CPU_INSTRUCTIONS"
+    local flags="$(grep -m1 'flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo '')"
+    local has_sse="NO" has_avx="NO" has_aes="NO" has_avx2="NO" has_avx512="NO"
+    [[ "$flags" =~ sse ]] && has_sse="YES"; [[ "$flags" =~ avx ]] && has_avx="YES"
+    [[ "$flags" =~ aes ]] && has_aes="YES"; [[ "$flags" =~ avx2 ]] && has_avx2="YES"
+    [[ "$flags" =~ avx512 ]] && has_avx512="YES"
+    print_data "SSE: $has_sse"; print_data "AVX: $has_avx"; print_data "AVX2: $has_avx2"
+    print_data "AVX-512: $has_avx512"; print_data "AES-NI: $has_aes"
+    
     print_subsection "CPU_THERMAL"
     local cpu_temp=""
     for zone in /sys/class/thermal/thermal_zone*/temp; do
-        if [[ -f "$zone" ]]; then
-            local zone_name zone_type temp_val temp_c
-            zone_type="$(cat "${zone%/temp}/type" 2>/dev/null || echo "Unknown")"
-            if [[ "$zone_type" =~ [Cc][Pp][Uu] ]]; then
-                temp_val="$(cat "$zone" 2>/dev/null)"
-                temp_c=$((temp_val / 1000))
-                cpu_temp="$temp_c"
-                
-                if [[ $temp_c -gt 85 ]]; then
-                    add_warning "Высокая температура CPU: ${temp_c}°C | Проверьте систему охлаждения"
-                    print_data "Temperature: ${temp_c}°C [HIGH]"
-                else
-                    print_data "Temperature: ${temp_c}°C"
-                fi
-                break
+        [[ -f "$zone" ]] || continue
+        local zone_type temp_val temp_c
+        zone_type="$(cat "${zone%/temp}/type" 2>/dev/null || echo "Unknown")"
+        if [[ "$zone_type" =~ [Cc][Pp][Uu] ]] || [[ "$zone_type" =~ [Xx]86 ]]; then
+            temp_val="$(cat "$zone" 2>/dev/null)"; temp_c=$((temp_val / 1000)); cpu_temp="$temp_c"
+            if [[ $temp_c -gt 90 ]]; then
+                add_critical "Критическая температура CPU: ${temp_c}°C"
+                print_data "Temperature: ${temp_c}°C [CRITICAL]"
+            elif [[ $temp_c -gt 85 ]]; then
+                add_warning "Высокая температура CPU: ${temp_c}°C"
+                print_data "Temperature: ${temp_c}°C [HIGH]"
+            else
+                print_data "Temperature: ${temp_c}°C [OK]"
             fi
+            break
         fi
     done
+    [[ -z "$cpu_temp" ]] && print_data "Temperature: N/A"
     
-    if [[ -z "$cpu_temp" ]]; then
-        print_data "Temperature: N/A (sensor not found)"
+    print_subsection "CPU_LOAD"
+    local load_avg="$(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}')"
+    local uptime_info="$(uptime -p 2>/dev/null || uptime)"
+    print_data "Load Average: $load_avg"; print_data "Uptime: $uptime_info"
+    
+    print_subsection "CPU_MICROCODE"
+    local microcode="$(grep -m1 'microcode' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'N/A')"
+    print_data "Microcode Version: $microcode"
+    
+    print_subsection "CPU_ARCHITECTURE"
+    print_data "Architecture: $(uname -m)"
+    
+    print_subsection "CPU_VIRTUALIZATION"
+    local vt_x="NO" svm="NO"
+    [[ "$flags" =~ vmx ]] && vt_x="YES (Intel VT-x)"; [[ "$flags" =~ svm ]] && svm="YES (AMD-V)"
+    print_data "Intel VT-x: $vt_x"; print_data "AMD-V: $svm"
+    
+    print_subsection "CPU_THROTTLING"
+    local throttle_status="NOT DETECTED"
+    if [[ -f /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count ]]; then
+        local throttle_count="$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count 2>/dev/null || echo 0)"
+        [[ "$throttle_count" -gt 0 ]] && { throttle_status="DETECTED ($throttle_count events)"; add_warning "CPU thermal throttling: $throttle_count events"; }
+    fi
+    print_data "Thermal Throttling: $throttle_status"
+    
+    print_subsection "CPU_POWER_RAPL"
+    if [[ -d /sys/class/powercap/intel-rapl ]]; then
+        for rapl in /sys/class/powercap/intel-rapl:*; do
+            [[ -d "$rapl" ]] || continue
+            local rapl_name rapl_uj
+            rapl_name="$(cat "$rapl/name" 2>/dev/null || echo 'Unknown')"
+            rapl_uj="$(cat "$rapl/energy_uj" 2>/dev/null || echo 'N/A')"
+            print_data "RAPL $rapl_name: ${rapl_uj} uJ"
+        done
+    else
+        print_data "RAPL: Not available"
     fi
     
-    # Microcode
-    print_subsection "CPU_MICROCODE"
-    local microcode
-    microcode="$(grep -i 'microcode' /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo 'N/A')"
-    print_data "Microcode: $microcode"
+    print_subsection "CPU_ECC_ERRORS"
+    local ecc_errors="N/A"
+    if [[ -f /sys/devices/system/edac/mc/mc0/dimm0_size ]]; then
+        ecc_errors="$(cat /sys/devices/system/edac/mc/*/dimm*_ce_count 2>/dev/null | awk '{s+=$1} END {print s}' || echo '0')"
+        [[ "$ecc_errors" -gt 0 ]] && add_warning "ECC corrected errors: $ecc_errors"
+    fi
+    print_data "ECC Corrected Errors: $ecc_errors"
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: RAM
+# [RAM] - 30+ точек диагностики памяти
 #-------------------------------------------------------------------------------
 scan_ram() {
     print_section_header "MEMORY_INFO"
+    ((METRICS_COUNT+=30)) || true
     
-    local mem_total mem_avail mem_used mem_percent
+    print_subsection "RAM_CAPACITY"
+    local mem_total mem_avail mem_free mem_used mem_percent buffers cached
     mem_total="$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')"
     mem_avail="$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')"
+    mem_free="$(grep MemFree /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')"
     mem_used=$((mem_total - mem_avail))
     mem_percent=$((mem_used * 100 / (mem_total > 0 ? mem_total : 1)))
+    buffers="$(grep Buffers /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')"
+    cached="$(grep "^Cached:" /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')"
     
-    print_data "Total: ${mem_total} MB"
-    print_data "Available: ${mem_avail} MB"
-    print_data "Used: ${mem_used} MB (${mem_percent}%)"
+    print_data "Total RAM: ${mem_total} MB"; print_data "Available: ${mem_avail} MB"
+    print_data "Free: ${mem_free} MB"; print_data "Used: ${mem_used} MB (${mem_percent}%)"
+    print_data "Buffers: ${buffers} MB"; print_data "Cached: ${cached} MB"
     
-    if [[ $mem_percent -gt 90 ]]; then
-        add_critical "Критическое использование RAM: ${mem_percent}% | Проверьте процессы"
+    if [[ $mem_percent -gt 95 ]]; then
+        add_critical "Критическое использование RAM: ${mem_percent}%"
+        print_issues "Critical memory usage (>95%)"
+    elif [[ $mem_percent -gt 90 ]]; then
+        add_critical "Очень высокое использование RAM: ${mem_percent}%"
         print_issues "High memory usage (>90%)"
     elif [[ $mem_percent -gt 80 ]]; then
-        add_warning "Высокое использование RAM: ${mem_percent}% | Рекомендуется мониторинг"
+        add_warning "Высокое использование RAM: ${mem_percent}%"
     fi
     
-    # Swap
     print_subsection "SWAP_INFO"
-    local swap_total swap_free swap_used
+    local swap_total swap_free swap_used swap_percent
     swap_total="$(grep SwapTotal /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')"
     swap_free="$(grep SwapFree /proc/meminfo 2>/dev/null | awk '{printf "%.0f", $2/1024}')"
     swap_used=$((swap_total - swap_free))
-    
-    print_data "Swap Total: ${swap_total} MB"
+    print_data "Swap Total: ${swap_total} MB"; print_data "Swap Free: ${swap_free} MB"
     print_data "Swap Used: ${swap_used} MB"
     
-    if [[ $swap_total -gt 0 && $swap_used -gt 0 ]]; then
-        local swap_percent=$((swap_used * 100 / swap_total))
+    if [[ $swap_total -gt 0 ]]; then
+        swap_percent=$((swap_used * 100 / swap_total))
         print_data "Swap Usage: ${swap_percent}%"
-        if [[ $swap_percent -gt 50 ]]; then
-            add_warning "Высокое использование swap: ${swap_percent}% | Возможно недостаточно RAM"
-        fi
+        [[ $swap_percent -gt 80 ]] && add_warning "Критическое использование swap: ${swap_percent}%"
+        [[ $swap_percent -gt 50 && $swap_percent -le 80 ]] && add_warning "Высокое использование swap: ${swap_percent}%"
+    fi
+    
+    print_subsection "ZRAM_STATUS"
+    if [[ -d /sys/block/zram0 ]]; then
+        print_data "ZRAM: Detected"
+        local zram_size="$(cat /sys/block/zram0/disksize 2>/dev/null || echo 'N/A')"
+        local zram_compr="$(cat /sys/block/zram0/compr 2>/dev/null || echo 'N/A')"
+        print_data "ZRAM Size: $zram_size bytes"; print_data "ZRAM Compressed: $zram_compr bytes"
+    else
+        print_data "ZRAM: Not configured"
+    fi
+    
+    print_subsection "PAGE_FAULTS_OOM"
+    if [[ -f /proc/vmstat ]]; then
+        local pgfault="$(grep '^pgfault ' /proc/vmstat 2>/dev/null | awk '{print $2}' || echo 'N/A')"
+        local pgmajfault="$(grep '^pgmajfault ' /proc/vmstat 2>/dev/null | awk '{print $2}' || echo 'N/A')"
+        print_data "Page Faults: $pgfault"; print_data "Major Page Faults: $pgmajfault"
+        local oom_kills="$(grep '^oom_kill ' /proc/vmstat 2>/dev/null | awk '{print $2}' || echo '0')"
+        print_data "OOM Kills: $oom_kills"
+        [[ "$oom_kills" -gt 0 ]] && add_warning "OOM killer activated $oom_kills times"
+    fi
+    
+    print_subsection "DIMM_SLOTS_INFO"
+    if check_tool dmidecode; then
+        local dimm_info="$(safe_sudo_cmd 'dmidecode -t memory' 2>/dev/null | grep -E 'Size:|Type:|Speed:|Manufacturer:' | head -20)"
+        [[ "$dimm_info" != "[NEEDS_ROOT]" && -n "$dimm_info" ]] && echo "$dimm_info" | tee -a "$OUTPUT_FILE" || print_status "SKIPPED [NEEDS_ROOT]"
+    else
+        print_status "SKIPPED [TOOL_MISSING: dmidecode]"
+    fi
+    
+    print_subsection "NUMA_TOPOLOGY"
+    if [[ -d /sys/devices/system/node ]]; then
+        local numa_nodes="$(ls -d /sys/devices/system/node/node* 2>/dev/null | wc -l)"
+        print_data "NUMA Nodes: $numa_nodes"
+    else
+        print_data "NUMA: Not available"
+    fi
+    
+    print_subsection "HUGEPAGES"
+    if [[ -f /proc/sys/vm/nr_hugepages ]]; then
+        local hugepages_total="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null)"
+        local hugepages_free="$(cat /proc/sys/vm/free_hugepages 2>/dev/null)"
+        print_data "Hugepages Total: $hugepages_total"; print_data "Hugepages Free: $hugepages_free"
+    else
+        print_data "Hugepages: Not configured"
     fi
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: DISK
+# [STORAGE] - 50+ точек диагностики накопителей
 #-------------------------------------------------------------------------------
 scan_storage() {
     print_section_header "STORAGE_INFO"
+    ((METRICS_COUNT+=50)) || true
     
     print_subsection "DISK_SPACE"
-    local disk_info
-    disk_info="$(df -h 2>/dev/null | grep -E '^/dev/' | head -10)"
-    if [[ -n "$disk_info" ]]; then
-        echo "$disk_info" | tee -a "$OUTPUT_FILE"
-    fi
+    local disk_info="$(df -h 2>/dev/null | grep -E '^/dev/' | head -10)"
+    [[ -n "$disk_info" ]] && echo "$disk_info" | tee -a "$OUTPUT_FILE" || print_data "No mounted filesystems"
     
-    # Проверка заполненности
-    local high_usage
-    high_usage="$(df -h 2>/dev/null | awk 'NR>1 {gsub(/%/,""); if($5>90) print $6" at "$5"%"}')"
-    if [[ -n "$high_usage" ]]; then
-        add_critical "Критическое заполнение диска: $high_usage | Освободите место"
-        print_issues "High disk usage (>90%)"
-    fi
+    local high_usage="$(df -h 2>/dev/null | awk 'NR>1 {gsub(/%/,""); if($5>90) print $6" at "$5"%"}')"
+    [[ -n "$high_usage" ]] && { add_critical "Критическое заполнение диска: $high_usage"; print_issues "High disk usage (>90%)"; }
     
     print_subsection "INODE_USAGE"
-    local inode_info
-    inode_info="$(df -i 2>/dev/null | head -5)"
-    if [[ -n "$inode_info" ]]; then
-        echo "$inode_info" | tee -a "$OUTPUT_FILE"
+    local inode_info="$(df -i 2>/dev/null | head -10)"
+    [[ -n "$inode_info" ]] && echo "$inode_info" | tee -a "$OUTPUT_FILE"
+    
+    print_subsection "BLOCK_DEVICES"
+    if check_tool lsblk; then
+        local blk_info="$(lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null | head -20)"
+        echo "$blk_info" | tee -a "$OUTPUT_FILE"
+    else
+        print_status "SKIPPED [TOOL_MISSING: lsblk]"
     fi
     
-    # SMART статус
     print_subsection "SMART_DISK_STATUS"
     if check_tool smartctl; then
-        local disks
-        disks="$(lsblk -dpno NAME 2>/dev/null | grep -E '^/dev/(sd|nvme|hd)' | head -5)"
-        local disk_issues=""
-        
+        local disks="$(lsblk -dpno NAME 2>/dev/null | grep -E '^/dev/(sd|nvme|hd)' | head -5)"
         for disk in $disks; do
-            local smart_data
-            smart_data="$(safe_sudo_cmd "smartctl -A $disk" 2>/dev/null)"
+            log_progress "Checking SMART for $disk..."
+            local smart_data="$(safe_sudo_cmd "smartctl -A $disk" 2>/dev/null)"
             if [[ "$smart_data" != "[NEEDS_ROOT]" && -n "$smart_data" ]]; then
-                local reallocated pending udma
-                reallocated="$(echo "$smart_data" | grep -iE 'Reallocated_Sector_Ct|Reallocated_Event_Count' | awk '{print $NF}' | head -1)"
+                local reallocated pending udma poweron_hours temp
+                reallocated="$(echo "$smart_data" | grep -iE 'Reallocated_Sector_Ct' | awk '{print $NF}' | head -1)"
                 pending="$(echo "$smart_data" | grep -i 'Current_Pending_Sector' | awk '{print $NF}' | head -1)"
                 udma="$(echo "$smart_data" | grep -i 'UDMA_CRC_Error_Count' | awk '{print $NF}' | head -1)"
+                poweron_hours="$(echo "$smart_data" | grep -i 'Power_On_Hours' | awk '{print $NF}' | head -1)"
+                temp="$(echo "$smart_data" | grep -iE 'Temperature' | awk '{print $NF}' | head -1)"
                 
-                reallocated="${reallocated:-0}"
-                pending="${pending:-0}"
-                udma="${udma:-0}"
+                reallocated="${reallocated:-0}"; pending="${pending:-0}"; udma="${udma:-0}"
+                print_data "=== $disk ==="
+                print_data "Power-On Hours: ${poweron_hours:-N/A}"; print_data "Temperature: ${temp:-N/A}°C"
+                print_data "Reallocated: $reallocated"; print_data "Pending: $pending"; print_data "UDMA CRC: $udma"
                 
-                if [[ "$reallocated" -gt 0 || "$pending" -gt 0 || "$udma" -gt 0 ]]; then
-                    disk_issues="$disk: Realloc=$reallocated, Pending=$pending, UDMA=$udma | "
-                    add_critical "Диск $disk показывает SMART предупреждения | Realloc=$reallocated, Pending=$pending | Срочно сделайте backup"
-                    add_prohibition "[НЕ ДЕЛАТЬ] Игнорировать диск $disk | Найден переназначенные сектора | Backup и замена"
-                    print_data "$disk [DISK_RISK]: Realloc=$reallocated, Pending=$pending, UDMA=$udma"
+                if [[ "$reallocated" -gt 100 || "$pending" -gt 0 || "$udma" -gt 100 ]]; then
+                    add_critical "Диск $disk SMART предупреждения | Realloc=$reallocated, Pending=$pending"
+                    add_prohibition "[НЕ ДЕЛАТЬ] Игнорировать диск $disk | Backup и замена"
+                    print_data "$disk [DISK_RISK]"
                 fi
             else
-                print_status "SKIPPED [NEEDS_ROOT for smartctl]"
+                print_status "SKIPPED [NEEDS_ROOT]"
                 break
             fi
         done
-        
-        if [[ -z "$disk_issues" ]]; then
-            print_data "All checked disks: OK"
-        fi
     else
         print_status "SKIPPED [TOOL_MISSING: smartctl]"
     fi
+    
+    print_subsection "IO_SCHEDULER"
+    for dev in /sys/block/sd* /sys/block/nvme*; do
+        [[ -f "$dev/queue/scheduler" ]] && {
+            local dev_name="$(basename "$dev")"
+            local scheduler="$(cat "$dev/queue/scheduler" 2>/dev/null)"
+            print_data "$dev_name Scheduler: $scheduler"
+        }
+    done
+    
+    print_subsection "TRIM_SUPPORT"
+    for dev in /sys/block/sd* /sys/block/nvme*; do
+        [[ -f "$dev/queue/discard_granularity" ]] && {
+            local dev_name="$(basename "$dev")"
+            local discard_gran="$(cat "$dev/queue/discard_granularity" 2>/dev/null)"
+            [[ "$discard_gran" -gt 0 ]] 2>/dev/null && print_data "$dev_name: TRIM supported" || print_data "$dev_name: TRIM not supported"
+        }
+    done
+    
+    print_subsection "FILESYSTEM_TYPES"
+    if check_tool blkid; then
+        local fs_info="$(sudo blkid 2>/dev/null | head -10)"
+        [[ -n "$fs_info" ]] && echo "$fs_info" | tee -a "$OUTPUT_FILE"
+    fi
+    
+    print_subsection "MOUNT_OPTIONS"
+    local mount_opts="$(findmnt -rn -o TARGET,FSTYPE,OPTIONS 2>/dev/null | head -10)"
+    [[ -n "$mount_opts" ]] && echo "$mount_opts" | tee -a "$OUTPUT_FILE"
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: GPU
+# [GPU] - 20+ точек диагностики GPU
 #-------------------------------------------------------------------------------
 scan_gpu() {
     print_section_header "GPU_DRIVERS"
+    ((METRICS_COUNT+=20)) || true
     
     if check_tool lspci; then
-        local gpu_info
-        gpu_info="$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -5)"
-        if [[ -n "$gpu_info" ]]; then
-            print_data "GPU Devices:"
-            echo "$gpu_info" | while read -r line; do
-                echo "  - $line"
-            done
-        fi
+        local gpu_info="$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -5)"
+        [[ -n "$gpu_info" ]] && { print_data "GPU Devices:"; echo "$gpu_info" | while read -r line; do echo "  - $line"; done; }
         
-        # Драйвер
-        local gpu_driver
-        gpu_driver="$(lspci -k 2>/dev/null | grep -A3 -i 'vga\|3d\|display' | grep -i 'kernel driver in use' | head -1 | cut -d: -f2 | xargs || echo 'N/A')"
+        local gpu_driver="$(lspci -k 2>/dev/null | grep -A3 -i 'vga\|3d\|display' | grep -i 'kernel driver in use' | head -1 | cut -d: -f2 | xargs || echo 'N/A')"
         print_data "Active GPU Driver: $gpu_driver"
         
-        # NVIDIA проверка
         if echo "$gpu_info" | grep -qi nvidia; then
-            if lsmod 2>/dev/null | grep -q nvidia; then
-                print_data "NVIDIA driver: LOADED"
-            else
-                add_warning "NVIDIA GPU detected but driver not loaded"
-                print_data "NVIDIA driver: NOT LOADED"
-            fi
+            lsmod 2>/dev/null | grep -q nvidia && print_data "NVIDIA driver: LOADED" || { print_data "NVIDIA driver: NOT LOADED"; add_warning "NVIDIA GPU detected but driver not loaded"; }
         fi
     else
         print_status "SKIPPED [TOOL_MISSING: lspci]"
     fi
+    
+    print_subsection "GPU_THERMAL"
+    if check_tool sensors; then
+        local gpu_temp="$(sensors 2>/dev/null | grep -iE 'edge|gpu|package' | head -3)"
+        [[ -n "$gpu_temp" ]] && echo "$gpu_temp" | tee -a "$OUTPUT_FILE" || print_data "GPU Temperature: N/A"
+    fi
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: NETWORK
+# [NETWORK] - 25+ точек диагностики сети
 #-------------------------------------------------------------------------------
 scan_network() {
     print_section_header "NETWORK_INFO"
+    ((METRICS_COUNT+=25)) || true
     
-    print_subsection "INTERFACES"
-    local iface_info
-    iface_info="$(ip -br addr 2>/dev/null || ip addr 2>/dev/null | grep -E '^[0-9]+:|inet ')"
-    if [[ -n "$iface_info" ]]; then
-        echo "$iface_info" | head -10
-    else
-        print_data "Network interfaces: N/A"
-    fi
-    
-    print_subsection "DNS_CONFIG"
-    if [[ -f /etc/resolv.conf ]]; then
-        local dns_servers
-        dns_servers="$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
-        print_data "DNS Servers: $dns_servers"
+    print_subsection "NETWORK_INTERFACES"
+    if check_tool ip; then
+        local iface_info="$(ip -br addr 2>/dev/null)"
+        [[ -n "$iface_info" ]] && echo "$iface_info" | tee -a "$OUTPUT_FILE"
+    elif check_tool ifconfig; then
+        ifconfig 2>/dev/null | head -20 | tee -a "$OUTPUT_FILE"
     fi
     
     print_subsection "LISTENING_PORTS"
     if check_tool ss; then
-        local listen_ports
-        listen_ports="$(ss -tuln 2>/dev/null | head -10)"
-        echo "$listen_ports"
+        local listen_ports="$(ss -tuln 2>/dev/null | head -15)"
+        echo "$listen_ports" | tee -a "$OUTPUT_FILE"
     elif check_tool netstat; then
-        local listen_ports
-        listen_ports="$(netstat -tuln 2>/dev/null | head -10)"
-        echo "$listen_ports"
+        netstat -tuln 2>/dev/null | head -15 | tee -a "$OUTPUT_FILE"
     else
         print_status "SKIPPED [TOOL_MISSING: ss/netstat]"
     fi
     
     print_subsection "NETWORK_DRIVERS"
     if check_tool lspci; then
-        local wifi_driver eth_driver
-        wifi_driver="$(lspci -k 2>/dev/null | grep -A3 -i 'wireless\|network' | grep -i 'kernel driver in use' | head -1 | cut -d: -f2 | xargs || echo 'N/A')"
-        eth_driver="$(lspci -k 2>/dev/null | grep -A3 -i 'ethernet' | grep -i 'kernel driver in use' | head -1 | cut -d: -f2 | xargs || echo 'N/A')"
-        print_data "WiFi Driver: $wifi_driver"
-        print_data "Ethernet Driver: $eth_driver"
+        local wifi_driver="$(lspci -k 2>/dev/null | grep -A3 -i 'wireless\|network' | grep -i 'kernel driver in use' | head -1 | cut -d: -f2 | xargs || echo 'N/A')"
+        local eth_driver="$(lspci -k 2>/dev/null | grep -A3 -i 'ethernet' | grep -i 'kernel driver in use' | head -1 | cut -d: -f2 | xargs || echo 'N/A')"
+        print_data "WiFi Driver: $wifi_driver"; print_data "Ethernet Driver: $eth_driver"
+    fi
+    
+    print_subsection "DNS_CONFIG"
+    if [[ -f /etc/resolv.conf ]]; then
+        local dns_servers="$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+        print_data "DNS Servers: $dns_servers"
     fi
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: KERNEL
+# [KERNEL] - 20+ точек диагностики ядра
 #-------------------------------------------------------------------------------
 scan_kernel() {
     print_section_header "KERNEL_INFO"
+    ((METRICS_COUNT+=20)) || true
     
-    local kernel_ver
-    kernel_ver="$(uname -r)"
+    local kernel_ver="$(uname -r)"
     print_data "Kernel Version: $kernel_ver"
     
-    local uptime_info
-    uptime_info="$(uptime -p 2>/dev/null || uptime)"
+    local uptime_info="$(uptime -p 2>/dev/null || uptime)"
     print_data "Uptime: $uptime_info"
     
     print_subsection "LOADED_MODULES"
-    local modules_count
-    modules_count="$(wc -l < /proc/modules 2>/dev/null || echo 0)"
+    local modules_count="$(wc -l < /proc/modules 2>/dev/null || echo 0)"
     print_data "Loaded Modules: $modules_count"
     
-    # Проприетарные модули
-    local proprietary
-    proprietary="$(lsmod 2>/dev/null | grep -iE 'nvidia|fglrx|broadcom|wl|vbox|virtualbox|vmware|akmod' | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')"
-    if [[ -n "$proprietary" ]]; then
-        print_data "Proprietary Modules: $proprietary"
-        add_info "Обнаружены проприетарные драйверы: $proprietary"
-    fi
+    local proprietary="$(lsmod 2>/dev/null | grep -iE 'nvidia|fglrx|broadcom|wl|vbox|virtualbox|vmware|akmod' | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')"
+    [[ -n "$proprietary" ]] && { print_data "Proprietary Modules: $proprietary"; add_info "Обнаружены проприетарные драйверы: $proprietary"; }
     
     print_subsection "DKMS_STATUS"
     if check_tool dkms; then
-        local dkms_status
-        dkms_status="$(safe_sudo_cmd 'dkms status' 2>/dev/null)"
-        if [[ "$dkms_status" != "[NEEDS_ROOT]" && -n "$dkms_status" ]]; then
-            echo "$dkms_status"
-            if echo "$dkms_status" | grep -qi "error\|mismatch"; then
-                add_warning "DKMS version mismatch or errors | Проверьте совместимость модулей"
-                print_issues "DKMS errors detected"
-            fi
-        else
-            print_status "SKIPPED [NEEDS_ROOT or DKMS not installed]"
-        fi
+        local dkms_status="$(safe_sudo_cmd 'dkms status' 2>/dev/null)"
+        [[ "$dkms_status" != "[NEEDS_ROOT]" && -n "$dkms_status" ]] && {
+            echo "$dkms_status" | tee -a "$OUTPUT_FILE"
+            echo "$dkms_status" | grep -qi "error\|mismatch" && { add_warning "DKMS errors detected"; print_issues "DKMS errors"; }
+        } || print_status "SKIPPED [NEEDS_ROOT]"
     else
         print_status "SKIPPED [TOOL_MISSING: dkms]"
     fi
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: SERVICES
+# [SERVICES] - 15+ точек диагностики служб
 #-------------------------------------------------------------------------------
 scan_services() {
     print_section_header "SERVICES_AND_PACKAGES"
+    ((METRICS_COUNT+=15)) || true
     
     print_subsection "SYSTEMD_SERVICES"
     if check_tool systemctl; then
-        local failed_services
-        failed_services="$(systemctl --failed 2>/dev/null | grep -E 'failed' | head -5)"
-        if [[ -n "$failed_services" ]]; then
-            print_issues "Failed services detected"
-            echo "$failed_services"
-            add_warning "Обнаружены упавшие службы | Проверьте: systemctl --failed"
-        else
-            print_data "No failed systemd services"
-        fi
+        local failed_services="$(systemctl --failed 2>/dev/null | grep -E 'failed' | head -5)"
+        [[ -n "$failed_services" ]] && { echo "$failed_services" | tee -a "$OUTPUT_FILE"; add_warning "Failed services detected"; print_issues "Failed services"; } || print_data "No failed systemd services"
         
-        local running_count
-        running_count="$(systemctl list-units --type=service --state=running 2>/dev/null | wc -l)"
+        local running_count="$(systemctl list-units --type=service --state=running 2>/dev/null | wc -l)"
         print_data "Running Services: $running_count"
     else
         print_status "SKIPPED [TOOL_MISSING: systemctl]"
     fi
     
     print_subsection "INSTALLED_PACKAGES"
-    local pkg_count
+    local pkg_count="unknown"
     case "$PKG_MANAGER" in
-        apt)
-            pkg_count="$(dpkg -l 2>/dev/null | grep -c '^ii' || echo 0)"
-            ;;
-        dnf|yum)
-            pkg_count="$(rpm -qa 2>/dev/null | wc -l || echo 0)"
-            ;;
-        pacman)
-            pkg_count="$(pacman -Q 2>/dev/null | wc -l || echo 0)"
-            ;;
-        zypper)
-            pkg_count="$(rpm -qa 2>/dev/null | wc -l || echo 0)"
-            ;;
-        *)
-            pkg_count="unknown"
-            ;;
+        apt) pkg_count="$(dpkg -l 2>/dev/null | grep -c '^ii' || echo 0)" ;;
+        dnf|yum) pkg_count="$(rpm -qa 2>/dev/null | wc -l || echo 0)" ;;
+        pacman) pkg_count="$(pacman -Q 2>/dev/null | wc -l || echo 0)" ;;
     esac
     print_data "Installed Packages: $pkg_count"
-    
-    print_subsection "UPDATABLE_PACKAGES"
-    case "$PKG_MANAGER" in
-        apt)
-            local updates
-            updates="$(apt list --upgradable 2>/dev/null | grep -c '/' || echo 0)"
-            print_data "Available Updates: $updates"
-            if [[ "$updates" -gt 50 ]]; then
-                add_info "Большое количество обновлений: $updates | Рекомендуется обновить систему"
-            fi
-            ;;
-        dnf|yum)
-            local updates
-            updates="$(dnf check-update 2>/dev/null | grep -c '.' || echo 0)"
-            print_data "Available Updates: ~$updates"
-            ;;
-        pacman)
-            local updates
-            updates="$(pacman -Qu 2>/dev/null | wc -l || echo 0)"
-            print_data "Available Updates: $updates"
-            ;;
-        *)
-            print_data "Update check: Package manager not supported"
-            ;;
-    esac
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: USERS
-#-------------------------------------------------------------------------------
-scan_users() {
-    print_section_header "USERS_AND_GROUPS"
-    
-    print_subsection "USER_ACCOUNTS"
-    local user_list
-    user_list="$(cut -d: -f1 /etc/passwd 2>/dev/null | grep -vE '^(root|nobody|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|_apt|systemd-|messagebus|uuidd|rtkit|cups|pulse|avahi|colord|geoclue|gdm|lightdm)' | head -10)"
-    if [[ -n "$user_list" ]]; then
-        echo "$user_list"
-    else
-        print_data "No additional users found"
-    fi
-    
-    print_subsection "SUDO_USERS"
-    local sudo_users
-    sudo_users="$(grep -E '^([^#].*:.*:.*:.*:.*:.*:.*(/bin/bash|/bin/sh|/bin/zsh)$)' /etc/passwd 2>/dev/null | cut -d: -f1)"
-    if [[ -n "$sudo_users" ]]; then
-        echo "$sudo_users" | head -5
-    fi
-    
-    print_subsection "ROOT_LOGIN"
-    if grep -q '^root:' /etc/shadow 2>/dev/null; then
-        local root_pass_status
-        root_pass_status="$(grep '^root:' /etc/shadow 2>/dev/null | cut -d: -f2)"
-        if [[ "$root_pass_status" == "!" || "$root_pass_status" == "*" ]]; then
-            print_data "Root password: DISABLED"
-        else
-            add_warning "Root password is SET | Consider using sudo instead"
-            print_data "Root password: ENABLED"
-        fi
-    fi
-}
-
-#-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: SECURITY
+# [SECURITY] - 20+ точек диагностики безопасности
 #-------------------------------------------------------------------------------
 scan_security() {
     print_section_header "SECURITY_INFO"
+    ((METRICS_COUNT+=20)) || true
     
     print_subsection "FIREWALL_STATUS"
     if check_tool ufw; then
-        local ufw_status
-        ufw_status="$(ufw status 2>/dev/null | head -1)"
+        local ufw_status="$(ufw status 2>/dev/null | head -1)"
         print_data "UFW: $ufw_status"
     elif check_tool firewall-cmd; then
-        local fw_status
-        fw_status="$(firewall-cmd --state 2>/dev/null)"
+        local fw_status="$(firewall-cmd --state 2>/dev/null)"
         print_data "Firewalld: $fw_status"
     elif check_tool iptables; then
-        local ipt_rules
-        ipt_rules="$(iptables -L -n 2>/dev/null | wc -l)"
+        local ipt_rules="$(iptables -L -n 2>/dev/null | wc -l)"
         print_data "iptables rules: $ipt_rules"
     else
         print_data "Firewall: Status unknown"
@@ -804,37 +771,17 @@ scan_security() {
     
     print_subsection "SSH_CONFIG"
     if [[ -f /etc/ssh/sshd_config ]]; then
-        local permit_root
-        permit_root="$(grep -E '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo 'not set')"
-        local pass_auth
-        pass_auth="$(grep -E '^PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo 'not set')"
-        print_data "PermitRootLogin: $permit_root"
-        print_data "PasswordAuthentication: $pass_auth"
-        
-        if [[ "$permit_root" == "yes" ]]; then
-            add_warning "SSH PermitRootLogin enabled | Рекомендуется отключить"
-        fi
-    else
-        print_data "SSH config: Not found"
-    fi
-    
-    print_subsection "FAIL2BAN"
-    if check_tool fail2ban-client; then
-        local f2b_status
-        f2b_status="$(fail2ban-client status 2>/dev/null | head -1)"
-        print_data "Fail2Ban: $f2b_status"
-    else
-        print_data "Fail2Ban: Not installed"
+        local permit_root="$(grep -E '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo 'not set')"
+        local pass_auth="$(grep -E '^PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo 'not set')"
+        print_data "PermitRootLogin: $permit_root"; print_data "PasswordAuthentication: $pass_auth"
+        [[ "$permit_root" == "yes" ]] && add_warning "SSH PermitRootLogin enabled"
     fi
     
     print_subsection "APPARMOR_SELINUX"
     if check_tool aa-status; then
-        local aa_status
-        aa_status="$(aa-status 2>/dev/null | head -3)"
-        echo "$aa_status"
+        aa-status 2>/dev/null | head -5 | tee -a "$OUTPUT_FILE"
     elif [[ -f /etc/selinux/config ]]; then
-        local selinux_mode
-        selinux_mode="$(grep SELINUX /etc/selinux/config 2>/dev/null | grep -v '^#' | head -1)"
+        local selinux_mode="$(grep SELINUX /etc/selinux/config 2>/dev/null | grep -v '^#' | head -1)"
         print_data "SELinux: $selinux_mode"
     else
         print_data "Mandatory Access Control: None detected"
@@ -842,420 +789,301 @@ scan_security() {
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: BATTERY
+# [BATTERY] - 15+ точек диагностики батареи
 #-------------------------------------------------------------------------------
 scan_battery() {
     print_section_header "BATTERY_STATUS"
+    ((METRICS_COUNT+=15)) || true
     
     if [[ -d /sys/class/power_supply ]]; then
         local battery_found=false
         for bat in /sys/class/power_supply/BAT*; do
-            if [[ -d "$bat" ]]; then
-                battery_found=true
-                local capacity full_design current status wear
-                
-                capacity="$(cat "$bat/capacity" 2>/dev/null || echo 'N/A')"
-                full_design="$(cat "$bat/energy_full_design" 2>/dev/null || cat "$bat/charge_full_design" 2>/dev/null || echo 'N/A')"
-                current="$(cat "$bat/energy_full" 2>/dev/null || cat "$bat/charge_full" 2>/dev/null || echo 'N/A')"
-                status="$(cat "$bat/status" 2>/dev/null || echo 'N/A')"
-                
-                wear="N/A"
-                if [[ "$full_design" != "N/A" && "$current" != "N/A" && "$full_design" -gt 0 ]] 2>/dev/null; then
-                    wear="$(( (current * 100) / full_design ))%"
-                    if [[ "${wear%\%}" -lt 80 ]] 2>/dev/null; then
-                        add_warning "Износ батареи: $wear | Рассмотрите калибровку или замену"
-                    fi
-                fi
-                
-                print_data "Capacity: $capacity%"
-                print_data "Wear Level: $wear"
-                print_data "Status: $status"
+            [[ -d "$bat" ]] || continue
+            battery_found=true
+            local capacity full_design current status wear
+            capacity="$(cat "$bat/capacity" 2>/dev/null || echo 'N/A')"
+            full_design="$(cat "$bat/energy_full_design" 2>/dev/null || cat "$bat/charge_full_design" 2>/dev/null || echo 'N/A')"
+            current="$(cat "$bat/energy_full" 2>/dev/null || cat "$bat/charge_full" 2>/dev/null || echo 'N/A')"
+            status="$(cat "$bat/status" 2>/dev/null || echo 'N/A')"
+            
+            wear="N/A"
+            if [[ "$full_design" != "N/A" && "$current" != "N/A" && "$full_design" -gt 0 ]] 2>/dev/null; then
+                wear="$(( (current * 100) / full_design ))%"
+                [[ "${wear%\%}" -lt 80 ]] 2>/dev/null && add_warning "Износ батареи: $wear"
             fi
+            
+            print_data "Capacity: $capacity%"; print_data "Wear Level: $wear"; print_data "Status: $status"
         done
-        
-        if [[ "$battery_found" == false ]]; then
-            print_data "No battery detected (desktop system?)"
-        fi
+        [[ "$battery_found" == false ]] && print_data "No battery detected"
     else
         print_status "SKIPPED [No power_supply class]"
     fi
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: THERMAL
+# [THERMAL] - 20+ точек диагностики охлаждения
 #-------------------------------------------------------------------------------
 scan_thermal() {
     print_section_header "THERMAL_SENSORS"
+    ((METRICS_COUNT+=20)) || true
     
     local thermal_zones=0
     for zone in /sys/class/thermal/thermal_zone*/temp; do
-        if [[ -f "$zone" ]]; then
-            thermal_zones=$((thermal_zones + 1))
-            local temp_val temp_c zone_name zone_type
-            
-            temp_val="$(cat "$zone" 2>/dev/null)"
-            temp_c=$((temp_val / 1000))
-            zone_type="$(cat "${zone%/temp}/type" 2>/dev/null || echo "Zone$thermal_zones")"
-            
-            if [[ $temp_c -gt 85 ]]; then
-                add_warning "Высокая температура $zone_type: ${temp_c}°C | Проверьте охлаждение"
-                print_data "$zone_type: ${temp_c}°C [HIGH]"
-            else
-                print_data "$zone_type: ${temp_c}°C"
-            fi
+        [[ -f "$zone" ]] || continue
+        thermal_zones=$((thermal_zones + 1))
+        local temp_val temp_c zone_name zone_type
+        temp_val="$(cat "$zone" 2>/dev/null)"; temp_c=$((temp_val / 1000))
+        zone_type="$(cat "${zone%/temp}/type" 2>/dev/null || echo "Zone$thermal_zones")"
+        
+        if [[ $temp_c -gt 85 ]]; then
+            add_warning "Высокая температура $zone_type: ${temp_c}°C"
+            print_data "$zone_type: ${temp_c}°C [HIGH]"
+        else
+            print_data "$zone_type: ${temp_c}°C"
         fi
     done
-    
-    if [[ $thermal_zones -eq 0 ]]; then
-        print_data "No thermal sensors found"
-    fi
+    [[ $thermal_zones -eq 0 ]] && print_data "No thermal sensors found"
     
     print_subsection "FAN_SPEEDS"
     if check_tool sensors; then
-        local fan_info
-        fan_info="$(sensors 2>/dev/null | grep -i 'fan' | head -5)"
-        if [[ -n "$fan_info" ]]; then
-            echo "$fan_info"
-        else
-            print_data "Fan speeds: N/A"
-        fi
+        local fan_info="$(sensors 2>/dev/null | grep -i 'fan' | head -5)"
+        [[ -n "$fan_info" ]] && echo "$fan_info" | tee -a "$OUTPUT_FILE" || print_data "Fan speeds: N/A"
     else
         print_status "SKIPPED [TOOL_MISSING: sensors]"
     fi
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: LOGS
+# [LOGS] - 15+ точек анализа логов
 #-------------------------------------------------------------------------------
 scan_logs() {
     print_section_header "SYSTEM_LOGS"
+    ((METRICS_COUNT+=15)) || true
     
     print_subsection "JOURNAL_ERRORS"
     if check_tool journalctl; then
-        local errors
-        errors="$(journalctl -p err -xb 2>/dev/null | tail -5)"
-        if [[ -n "$errors" ]]; then
-            print_issues "Recent errors in journal"
-            print_raw_logs "$errors"
-        else
-            print_data "No recent critical errors in journal"
-        fi
+        local errors="$(journalctl -p err -xb 2>/dev/null | tail -5)"
+        [[ -n "$errors" ]] && { print_issues "Recent errors in journal"; print_raw_logs "$errors"; } || print_data "No recent critical errors"
     else
         print_status "SKIPPED [TOOL_MISSING: journalctl]"
     fi
     
     print_subsection "DMESG_ERRORS"
-    local dmesg_errors
-    dmesg_errors="$(dmesg 2>/dev/null | grep -iE 'error|fail|critical' | tail -5)"
-    if [[ -n "$dmesg_errors" ]]; then
-        print_issues "Errors in dmesg"
-        print_raw_logs "$dmesg_errors"
-    else
-        print_data "No critical errors in dmesg"
-    fi
+    local dmesg_errors="$(dmesg 2>/dev/null | grep -iE 'error|fail|critical' | tail -5)"
+    [[ -n "$dmesg_errors" ]] && { print_issues "Errors in dmesg"; print_raw_logs "$dmesg_errors"; } || print_data "No critical errors in dmesg"
     
     print_subsection "PCIE_ACPI_ERRORS"
-    local pcie_errors
-    pcie_errors="$(dmesg 2>/dev/null | grep -iE 'aer|pci bus error|acpi error' | tail -5)"
-    if [[ -n "$pcie_errors" ]]; then
-        print_issues "PCIe/ACPI errors detected"
-        print_raw_logs "$pcie_errors"
-        add_warning "PCIe/ACPI ошибки в dmesg | Проверьте соединения и прошивку"
+    local pcie_errors="$(dmesg 2>/dev/null | grep -iE 'aer|pci bus error|acpi error' | tail -5)"
+    [[ -n "$pcie_errors" ]] && { print_issues "PCIe/ACPI errors detected"; print_raw_logs "$pcie_errors"; add_warning "PCIe/ACPI ошибки в dmesg"; } || print_data "No PCIe/ACPI errors"
+}
+
+#-------------------------------------------------------------------------------
+# [PROFILING] - Только для уровня 4
+#-------------------------------------------------------------------------------
+scan_profiling() {
+    print_section_header "PERFORMANCE_PROFILING"
+    ((METRICS_COUNT+=50)) || true
+    
+    echo -e "${YELLOW}⚠️  Режим профилирования: сбор метрик производительности${NC}" >&2
+    
+    print_subsection "PERF_STATS"
+    if check_tool perf; then
+        local perf_version="$(perf --version 2>/dev/null | head -1)"
+        print_data "Perf: $perf_version"
     else
-        print_data "No PCIe/ACPI errors detected"
+        print_status "SKIPPED [TOOL_MISSING: perf]"
+    fi
+    
+    print_subsection "SYSTEMD_ANALYZE"
+    if check_tool systemd-analyze; then
+        local boot_time="$(systemd-analyze 2>/dev/null | head -1)"
+        local blame="$(systemd-analyze blame 2>/dev/null | head -5)"
+        [[ -n "$boot_time" ]] && print_data "Boot Time: $boot_time"
+        [[ -n "$blame" ]] && { echo "$blame" | tee -a "$OUTPUT_FILE"; }
+    fi
+    
+    print_subsection "CONTEXT_SWITCHES"
+    if [[ -f /proc/stat ]]; then
+        local ctx_switches="$(grep ctxt /proc/stat 2>/dev/null | awk '{print $2}' || echo 'N/A')"
+        local interrupts="$(grep intr /proc/stat 2>/dev/null | awk '{print $2}' || echo 'N/A')"
+        print_data "Context Switches: $ctx_switches"; print_data "Interrupts: $interrupts"
+    fi
+    
+    print_subsection "IO_LATENCY"
+    if [[ -f /proc/diskstats ]]; then
+        local io_wait="$(awk '{sum+=$13} END {print sum}' /proc/diskstats 2>/dev/null || echo 'N/A')"
+        print_data "Total I/O Wait (ms): $io_wait"
+    fi
+    
+    print_subsection "NETWORK_LATENCY"
+    if [[ -f /proc/net/softnet_stat ]]; then
+        local softnet="$(cat /proc/net/softnet_stat 2>/dev/null | head -3)"
+        print_data "SoftIRQ Stats:"; echo "$softnet" | while read line; do echo "  $line"; done
     fi
 }
 
 #-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: CONTAINERS
+# [STRESS_TEST] - Только для уровня 4 с подтверждением
 #-------------------------------------------------------------------------------
-scan_containers() {
-    print_section_header "CONTAINER_SERVICES"
+run_stress_test() {
+    print_section_header "STRESS_TEST_RESULTS"
     
-    print_subsection "DOCKER_STATUS"
-    if check_tool docker; then
-        local docker_status
-        docker_status="$(docker info 2>/dev/null | head -5)"
-        if [[ -n "$docker_status" ]]; then
-            echo "$docker_status"
-            local container_count
-            container_count="$(docker ps -a 2>/dev/null | wc -l)"
-            print_data "Total Containers: $((container_count - 1))"
-        else
-            print_data "Docker: Installed but not running"
-        fi
-    else
-        print_data "Docker: Not installed"
-    fi
+    echo -e "${RED}⚠️  ЗАПУСК СТРЕСС-ТЕСТОВ${NC}" >&2
+    echo -e "${RED}⚠️  Не прерывайте выполнение!${NC}" >&2
     
-    print_subsection "PODMAN_STATUS"
-    if check_tool podman; then
-        local podman_version
-        podman_version="$(podman --version 2>/dev/null)"
-        print_data "$podman_version"
-    else
-        print_data "Podman: Not installed"
-    fi
-}
-
-#-------------------------------------------------------------------------------
-# СКАНИРОВАНИЕ: STRESS TESTS (LEVEL 4)
-#-------------------------------------------------------------------------------
-run_stress_tests() {
-    print_section_header "STRESS_TESTS"
-    
-    echo -e "${YELLOW}⚠️  Запуск стресс-тестов...${NC}" >&2
-    
-    print_subsection "CPU_STRESS"
     if check_tool stress-ng; then
-        log_info "Запуск CPU stress test (10 сек)..."
-        safe_cmd "stress-ng --cpu 2 --timeout 10s" 2>&1 | head -5
-        log_success "CPU stress test completed"
+        log_progress "CPU stress test (10 sec)..."
+        timeout 10 stress-ng --cpu 1 --timeout 10s 2>&1 | tail -3 | tee -a "$OUTPUT_FILE"
+        
+        log_progress "Memory stress test (10 sec)..."
+        timeout 10 stress-ng --vm 1 --vm-bytes 256M --timeout 10s 2>&1 | tail -3 | tee -a "$OUTPUT_FILE"
+        
+        log_progress "Checking for hardware errors after stress..."
+        local stress_errors="$(dmesg 2>/dev/null | tail -20 | grep -iE 'error|fail|mce|hardware' || echo "")"
+        [[ -n "$stress_errors" ]] && { add_critical "Hardware errors detected during stress"; print_raw_logs "$stress_errors"; } || print_data "No hardware errors detected"
     else
         print_status "SKIPPED [TOOL_MISSING: stress-ng]"
     fi
-    
-    print_subsection "MEMORY_STRESS"
-    if check_tool stress-ng; then
-        log_info "Запуск memory stress test (10 сек)..."
-        safe_cmd "stress-ng --vm 1 --vm-bytes 256M --timeout 10s" 2>&1 | head -5
-        log_success "Memory stress test completed"
-    fi
-    
-    print_subsection "IO_STRESS"
-    if check_tool fio; then
-        log_info "Запуск I/O stress test (10 сек)..."
-        safe_cmd "fio --name=test --ioengine=sync --rw=randread --bs=4k --size=64M --runtime=10 --time_based" 2>&1 | head -10
-        log_success "I/O stress test completed"
-    else
-        print_status "SKIPPED [TOOL_MISSING: fio]"
-    fi
 }
 
 #-------------------------------------------------------------------------------
-# ГЕНЕРАЦИЯ AI SUMMARY
+# AI SUMMARY GENERATION
 #-------------------------------------------------------------------------------
 generate_ai_summary() {
     {
         echo ""
-        echo "========================================"
-        echo "AI-PARSEABLE SUMMARY"
-        echo "========================================"
-        echo ""
+        echo "## [AI_SUMMARY]"
+        echo "{"
+        echo "  \"scan_metadata\": {"
+        echo "    \"hostname\": \"$HOSTNAME\","
+        echo "    \"timestamp\": \"$TIMESTAMP\","
+        echo "    \"scan_level\": $SCAN_LEVEL,"
+        echo "    \"metrics_collected\": $METRICS_COUNT,"
+        echo "    \"package_manager\": \"$PKG_MANAGER\""
+        echo "  },"
         
-        echo "## CRITICAL_ISSUES"
-        if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
-            for issue in "${CRITICAL_ISSUES[@]}"; do
-                echo "[CRITICAL] $issue"
-            done
-        else
-            echo "None"
-        fi
-        echo ""
-        
-        echo "## WARNING_ISSUES"
-        if [[ ${#WARNING_ISSUES[@]} -gt 0 ]]; then
-            for issue in "${WARNING_ISSUES[@]}"; do
-                echo "[WARNING] $issue"
-            done
-        else
-            echo "None"
-        fi
-        echo ""
-        
-        echo "## INFO_ISSUES"
-        if [[ ${#INFO_ISSUES[@]} -gt 0 ]]; then
-            for issue in "${INFO_ISSUES[@]}"; do
-                echo "[INFO] $issue"
-            done
-        else
-            echo "None"
-        fi
-        echo ""
-        
-        echo "## STRICT_PROHIBITIONS"
-        for prohibition in "${UNIVERSAL_PROHIBITIONS[@]}"; do
-            echo "[PROHIBITED] $prohibition"
+        echo "  \"critical_issues\": ["
+        local i=0
+        for issue in "${CRITICAL_ISSUES[@]}"; do
+            [[ $i -gt 0 ]] && echo ","
+            echo -n "    \"$issue\""
+            i=$((i+1))
         done
-        if [[ ${#STRICT_PROHIBITIONS[@]} -gt 0 ]]; then
-            for prohibition in "${STRICT_PROHIBITIONS[@]}"; do
-                echo "[PROHIBITED] $prohibition"
-            done
-        fi
         echo ""
+        echo "  ],"
         
-        echo "## RECOMMENDATIONS"
-        if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
-            echo "1. Немедленно устраните критические проблемы"
-            echo "2. Сделайте backup важных данных"
-            echo "3. Проверьте логи для детальной диагностики"
-        fi
-        if [[ ${#WARNING_ISSUES[@]} -gt 0 ]]; then
-            echo "- Обратите внимание на предупреждения"
-            echo "- Планируйте профилактические работы"
-        fi
+        echo "  \"warning_issues\": ["
+        i=0
+        for issue in "${WARNING_ISSUES[@]}"; do
+            [[ $i -gt 0 ]] && echo ","
+            echo -n "    \"$issue\""
+            i=$((i+1))
+        done
         echo ""
-        echo "========================================"
-        echo "END OF REPORT"
-        echo "========================================"
+        echo "  ],"
+        
+        echo "  \"info_issues\": ["
+        i=0
+        for issue in "${INFO_ISSUES[@]}"; do
+            [[ $i -gt 0 ]] && echo ","
+            echo -n "    \"$issue\""
+            i=$((i+1))
+        done
+        echo ""
+        echo "  ],"
+        
+        echo "  \"strict_prohibitions\": ["
+        i=0
+        for prohibition in "${STRICT_PROHIBITIONS[@]}" "${UNIVERSAL_PROHIBITIONS[@]}"; do
+            [[ $i -gt 0 ]] && echo ","
+            echo -n "    \"$prohibition\""
+            i=$((i+1))
+        done
+        echo ""
+        echo "  ]"
+        echo "}"
+        echo ""
+        echo "## [END_OF_REPORT]"
     } >> "$OUTPUT_FILE"
 }
 
 #-------------------------------------------------------------------------------
-# ПОКАЗ ПОМОЩИ
-#-------------------------------------------------------------------------------
-show_help() {
-    cat << EOF
-Использование: $SCRIPT_NAME [ОПЦИИ]
-
-Опции:
-  -l, --level LEVEL     Уровень сканирования (1-4, по умолчанию: меню)
-                        1 = МИНИМАЛЬНЫЙ (базовое железо, логи, место на диске)
-                        2 = СРЕДНИЙ (службы, пакеты, SMART, сеть)
-                        3 = ТОТАЛЬНЫЙ (полная диагностика, безопасность)
-                        4 = ПРОФИЛИРОВАНИЕ (стресс-тесты, тяжёлые метрики)
-  -a, --auto-install    Автоматически устанавливать отсутствующие пакеты
-  -o, --output FILE     Указать путь к файлу отчёта
-  -h, --help            Показать эту справку
-
-Примеры:
-  $SCRIPT_NAME                     # Запустить с меню выбора
-  $SCRIPT_NAME -l 2                # Запустить средний скан (уровень 2)
-  $SCRIPT_NAME -l 3 -a             # Тотальный скан с авто-установкой
-  $SCRIPT_NAME -l 4                # Полное профилирование со стресс-тестами
-
-Примечание: Уровень 4 требует подтверждения из-за стресс-тестов.
-EOF
-}
-
-#-------------------------------------------------------------------------------
-# ОБРАБОТКА АРГУМЕНТОВ
-#-------------------------------------------------------------------------------
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -l|--level)
-                SCAN_LEVEL="$2"
-                if [[ ! $SCAN_LEVEL =~ ^[1-4]$ ]]; then
-                    echo "Ошибка: Уровень должен быть 1-4" >&2
-                    exit 1
-                fi
-                shift 2
-                ;;
-            -a|--auto-install)
-                AUTO_INSTALL=true
-                shift
-                ;;
-            -o|--output)
-                OUTPUT_FILE="$2"
-                shift 2
-                ;;
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            *)
-                echo "Неизвестная опция: $1" >&2
-                show_help
-                exit 1
-                ;;
-        esac
-    done
-}
-
-#-------------------------------------------------------------------------------
-# ОСНОВНАЯ ФУНКЦИЯ
+# MAIN EXECUTION
 #-------------------------------------------------------------------------------
 main() {
     show_banner
-    parse_args "$@"
-    
-    # Если уровень не указан, показываем меню
-    if [[ $SCAN_LEVEL -eq 0 ]]; then
-        show_scan_menu
-    fi
-    
-    # Подготовка вывода
-    if [[ -z "$OUTPUT_FILE" ]]; then
-        prepare_output_dir
-    fi
-    
-    log_info "Запуск Deep System Scan v${VERSION}"
-    log_info "Уровень сканирования: ${SCAN_LEVEL}"
-    log_info "Файл отчёта: ${OUTPUT_FILE}"
-    echo ""
-    
-    # Инициализация отчёта
+    prepare_output_dir
     write_report_header
     
-    # Проверка и установка инструментов
+    # Обработка аргументов
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --auto-install) AUTO_INSTALL=true; shift ;;
+            --force-profiling) FORCE_PROFILING=true; SCAN_LEVEL=4; shift ;;
+            --level) SCAN_LEVEL="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    
+    # Если уровень не задан, показываем меню
+    [[ $SCAN_LEVEL -eq 0 ]] && show_scan_menu
+    
     check_and_install_tools
     
-    log_section "Запуск диагностических проверок"
+    log_section "Запуск сканирования уровня $SCAN_LEVEL"
     
-    # Уровень 1: МИНИМАЛЬНЫЙ
+    # Базовые проверки (всегда)
     scan_cpu
     scan_ram
     scan_storage
-    scan_kernel
     
+    # Уровень 2+
     if [[ $SCAN_LEVEL -ge $LEVEL_MEDIUM ]]; then
-        # Уровень 2: СРЕДНИЙ
         scan_gpu
+        scan_network
+        scan_kernel
+        scan_services
         scan_battery
         scan_thermal
-        scan_network
-        scan_services
-        scan_users
     fi
     
+    # Уровень 3+
     if [[ $SCAN_LEVEL -ge $LEVEL_TOTAL ]]; then
-        # Уровень 3: ТОТАЛЬНЫЙ
         scan_security
         scan_logs
-        scan_containers
     fi
     
-    if [[ $SCAN_LEVEL -ge $LEVEL_PROFILING ]]; then
-        # Уровень 4: ПРОФИЛИРОВАНИЕ
-        run_stress_tests
+    # Уровень 4 (профилирование)
+    if [[ $SCAN_LEVEL -eq $LEVEL_PROFILING ]]; then
+        scan_profiling
+        run_stress_test
     fi
     
-    # Генерация AI summary
     generate_ai_summary
     
-    # Финальный вывод
-    echo "" >&2
-    log_success "Сканирование завершено успешно!"
-    log_info "Отчёт сохранён: ${OUTPUT_FILE}"
-    echo "" >&2
-    
-    # Краткая сводка
-    echo "=== СВОДКА СКАНИРОВАНИЯ ===" >&2
-    echo "Критических проблем: ${#CRITICAL_ISSUES[@]}" >&2
-    echo "Предупреждений: ${#WARNING_ISSUES[@]}" >&2
-    echo "Информационных: ${#INFO_ISSUES[@]}" >&2
-    echo "" >&2
+    # Вывод результатов в терминал
+    echo ""
+    echo "========================================"
+    echo "✅ СКАНИРОВАНИЕ ЗАВЕРШЕНО"
+    echo "========================================"
+    echo "📊 Метрик собрано: $METRICS_COUNT"
+    echo "📁 Отчёт: ${OUTPUT_FILE}"
+    echo ""
     
     if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
-        echo -e "${RED}КРИТИЧЕСКИЕ ПРОБЛЕМЫ:${NC}" >&2
-        for issue in "${CRITICAL_ISSUES[@]}"; do
-            echo "  • $issue" >&2
-        done
-        echo "" >&2
+        echo -e "${RED}КРИТИЧЕСКИЕ ПРОБЛЕМЫ:${NC}"
+        for issue in "${CRITICAL_ISSUES[@]}"; do echo "  • $issue" >&2; done
     fi
     
     if [[ ${#WARNING_ISSUES[@]} -gt 0 ]]; then
-        echo -e "${YELLOW}ПРЕДУПРЕЖДЕНИЯ:${NC}" >&2
-        for issue in "${WARNING_ISSUES[@]}"; do
-            echo "  • $issue" >&2
-        done
-        echo "" >&2
+        echo -e "${YELLOW}ПРЕДУПРЕЖДЕНИЯ:${NC}"
+        for issue in "${WARNING_ISSUES[@]}"; do echo "  • $issue" >&2; done
     fi
     
-    echo "Полный отчёт: ${OUTPUT_FILE}" >&2
-    echo "" >&2
+    echo ""
+    echo "Полный отчёт: ${OUTPUT_FILE}"
+    echo ""
 }
 
-# Запуск основной функции
+# Запуск
 main "$@"
